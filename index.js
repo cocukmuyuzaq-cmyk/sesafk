@@ -3,10 +3,9 @@ import {
     Client as PanelClient, GatewayIntentBits, EmbedBuilder, ActivityType,
     ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder,
     ModalBuilder, TextInputBuilder, TextInputStyle,
-    InteractionType, Events, PermissionsBitField
+    InteractionType, Events
 } from 'discord.js';
 import { Client as SelfClient } from 'discord.js-selfbot-v13';
-import { joinVoiceChannel, VoiceConnectionStatus, entersState, getVoiceConnection } from '@discordjs/voice';
 import 'libsodium-wrappers';
 import { saveEncrypted, loadEncrypted } from './crypto.js';
 
@@ -23,12 +22,12 @@ if (!config.AES_KEY || config.AES_KEY.length < 16) { console.error('❌ AES_KEY 
 function loadDB() { return loadEncrypted(config.DB_FILE, config.AES_KEY, { users: [] }); }
 function saveDB(db) { saveEncrypted(config.DB_FILE, db, config.AES_KEY); }
 
-const activeSessions = new Map(); // userId -> { client, connection, config, muted, deafened, streaming }
-const userPanels = new Map(); // userId -> { messageId, channelId }
+const activeSessions = new Map();
 
-// ─── Self bot başlat ───
+// ─── Self bot başlat (kütüphanenin kendi voice manager'ı ile) ───
 async function startSelfBot(entry) {
-    const { userId, token, guildId, channelId, muted = false, deafened = true } = entry;
+    const { id, userId, token, guildId, channelId, muted = false, deafened = true } = entry;
+
     if (activeSessions.has(userId)) {
         await stopSelfBot(userId);
     }
@@ -36,75 +35,95 @@ async function startSelfBot(entry) {
     const client = new SelfClient({ checkUpdate: false });
 
     return new Promise((resolve) => {
-        const timeout = setTimeout(() => { try { client.destroy(); } catch {} resolve({ ok: false, msg: 'Giriş zaman aşımı' }); }, 30000);
+        const timeout = setTimeout(() => {
+            try { client.destroy(); } catch {}
+            resolve({ ok: false, msg: 'Giriş zaman aşımı (30s)' });
+        }, 30000);
 
         client.once('ready', async () => {
             clearTimeout(timeout);
             logOk('SELF', `Giriş: ${client.user.tag}`);
 
-            try { client.user.setPresence({ activities: [{ name: 'Sesde AFK', type: 'CUSTOM', state: 'Sesde AFK' }], status: 'online' }); } catch {}
+            try {
+                client.user.setPresence({
+                    activities: [{ name: 'Sesde AFK', type: 'CUSTOM', state: 'Sesde AFK' }],
+                    status: 'online'
+                });
+            } catch {}
 
             const guild = client.guilds.cache.get(guildId);
             if (!guild) { try { client.destroy(); } catch {} return resolve({ ok: false, msg: 'Sunucu bulunamadı' }); }
+
             const channel = guild.channels.cache.get(channelId);
             if (!channel) { try { client.destroy(); } catch {} return resolve({ ok: false, msg: 'Kanal bulunamadı' }); }
 
+            // Kanal dolu mu kontrolü (abort hatasının sık nedeni)
+            if (channel.userLimit > 0 && channel.members.size >= channel.userLimit) {
+                try { client.destroy(); } catch {}
+                return resolve({ ok: false, msg: `Kanal dolu (limit: ${channel.userLimit})` });
+            }
+
             try {
-                const connection = joinVoiceChannel({
-                    channelId: channel.id, guildId: guild.id,
-                    adapterCreator: guild.voiceAdapterCreator,
-                    selfMute: muted, selfDeaf: deafened,
+                // Kütüphanenin kendi joinChannel metodu
+                const connection = await client.voice.joinChannel(channel, {
+                    selfMute: muted,
+                    selfDeaf: deafened,
+                    timeout: 60000, // 60 saniye timeout
                 });
-                await entersState(connection, VoiceConnectionStatus.Ready, 30000);
+
                 logOk('SELF', `'${channel.name}' kanalına bağlandı`);
 
                 activeSessions.set(userId, { client, connection, config: entry, muted, deafened, streaming: false });
 
-                connection.on(VoiceConnectionStatus.Disconnected, async () => {
+                // Bağlantı koptuğunda yeniden bağlan
+                connection.on('disconnect', () => {
                     logWarn('SELF', `Bağlantı koptu, yeniden bağlanılıyor...`);
-                    try {
-                        await Promise.race([
-                            entersState(connection, VoiceConnectionStatus.Signalling, 5000),
-                            entersState(connection, VoiceConnectionStatus.Connecting, 5000),
-                        ]);
-                    } catch {
-                        connection.destroy();
-                        if (config.RECONNECT.enabled) setTimeout(() => reconnectSelf(entry), config.RECONNECT.delayMs);
+                    if (config.RECONNECT.enabled) {
+                        setTimeout(() => reconnectSelf(entry), config.RECONNECT.delayMs);
                     }
                 });
+
                 resolve({ ok: true, msg: `'${channel.name}' kanalına bağlandı` });
             } catch (e) {
+                logErr('SELF', `Ses hatası: ${e.message}`);
                 try { client.destroy(); } catch {}
                 resolve({ ok: false, msg: `Ses hatası: ${e.message}` });
             }
         });
 
         client.on('error', (e) => logErr('SELF', `Client hatası: ${e.message}`));
-        client.login(token).catch((e) => { clearTimeout(timeout); resolve({ ok: false, msg: `Giriş hatası: ${e.message}` }); });
+
+        client.login(token).catch((e) => {
+            clearTimeout(timeout);
+            resolve({ ok: false, msg: `Giriş hatası: ${e.message}` });
+        });
     });
 }
 
 async function reconnectSelf(entry) {
     const old = activeSessions.get(entry.userId);
-    if (old) { try { old.connection?.destroy(); } catch {} try { old.client?.destroy(); } catch {} activeSessions.delete(entry.userId); }
+    if (old) {
+        try { old.connection?.disconnect(); } catch {}
+        try { old.client?.destroy(); } catch {}
+        activeSessions.delete(entry.userId);
+    }
     await startSelfBot(entry);
 }
 
 async function stopSelfBot(userId) {
     const entry = activeSessions.get(userId);
     if (!entry) return { ok: false, msg: 'Aktif oturum yok' };
-    try { entry.connection?.destroy(); } catch {}
+    try { entry.connection?.disconnect(); } catch {}
     try { entry.client?.destroy(); } catch {}
     activeSessions.delete(userId);
     return { ok: true, msg: 'Durduruldu' };
 }
 
-// ─── Panel embed ───
+// ─── Panel embed (aynı) ───
 function buildPanelEmbed(db, userId) {
     const session = activeSessions.get(userId);
-    const userEntry = db.users.find(u => u.userId === userId);
-    const status = session ? '🟢 Bağlı' : '🔴 Bağlı değil';
     const accountCount = db.users.filter(u => u.userId === userId).length;
+    const status = session ? '🟢 Bağlı' : '🔴 Bağlı değil';
 
     return new EmbedBuilder()
         .setColor(session ? 0x00ff00 : 0xff8fc7)
@@ -112,7 +131,7 @@ function buildPanelEmbed(db, userId) {
         .setDescription(
             `**Durum:** ${status}\n` +
             `**Hesap Sayısı:** ${accountCount}\n` +
-            (session ? `**Kanal:** <#${session.config.channelId}>\n**Mikrofon:** ${session.muted ? '🔇 Kapalı' : '🔊 Açık'}\n**Kulaklık:** ${session.deafened ? '🔇 Kapalı' : '🔊 Açık'}\n**Yayın:** ${session.streaming ? '🟢 Aktif' : '⚫ Kapalı'}\n` : '') +
+            (session ? `**Kanal:** <#${session.config.channelId}>\n**Mikrofon:** ${session.muted ? '🔇 Kapalı' : '🔊 Açık'}\n**Kulaklık:** ${session.deafened ? '🔇 Kapalı' : '🔊 Açık'}\n` : '') +
             `\n**Token:** AES-256-GCM ile şifreli`
         )
         .setThumbnail(config.LOGO_URL)
@@ -134,18 +153,11 @@ function buildPanelComponents(db, userId) {
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('btn_mic_toggle').setLabel(session?.muted ? 'Mik Aç' : 'Mik Kapat').setEmoji(session?.muted ? '🔊' : '🔇').setStyle(ButtonStyle.Secondary).setDisabled(!session),
         new ButtonBuilder().setCustomId('btn_deaf_toggle').setLabel(session?.deafened ? 'Kulak Aç' : 'Kulak Kapat').setEmoji(session?.deafened ? '🔊' : '🔇').setStyle(ButtonStyle.Secondary).setDisabled(!session),
-        new ButtonBuilder().setCustomId('btn_stream_start').setLabel('Yayın Başlat').setEmoji('🔴').setStyle(ButtonStyle.Danger).setDisabled(!session || session.streaming),
-        new ButtonBuilder().setCustomId('btn_stream_stop').setLabel('Durdur').setEmoji('⏹️').setStyle(ButtonStyle.Secondary).setDisabled(!session || !session.streaming),
-    );
-
-    const row3 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('btn_leave').setLabel('Ses Kanalından Çıkar').setEmoji('🚪').setStyle(ButtonStyle.Danger).setDisabled(!session),
-        new ButtonBuilder().setCustomId('btn_reconnect').setLabel('Yenile (Sıfırdan Bağla)').setEmoji('🔄').setStyle(ButtonStyle.Primary).setDisabled(!session),
-        new ButtonBuilder().setCustomId('btn_move_channel').setLabel('Kanal Taşı').setEmoji('📢').setStyle(ButtonStyle.Secondary).setDisabled(!session),
-        new ButtonBuilder().setCustomId('btn_rpc').setLabel('RPC Ayarla').setEmoji('🎮').setStyle(ButtonStyle.Secondary).setDisabled(!session),
+        new ButtonBuilder().setCustomId('btn_reconnect').setLabel('Yenile (Sıfırdan)').setEmoji('🔄').setStyle(ButtonStyle.Primary).setDisabled(!session),
     );
 
-    return [row1, row2, row3];
+    return [row1, row2];
 }
 
 async function refreshPanel(interaction, db, userId) {
@@ -178,54 +190,48 @@ main.once(Events.ClientReady, async () => {
     });
 });
 
-// ─── Slash + buton + modal + select ───
+// ─── Etkileşimler ───
 main.on(Events.InteractionCreate, async (interaction) => {
     const userId = interaction.user.id;
     let db = loadDB();
 
-    // Slash
     if (interaction.isChatInputCommand()) {
         if (['panel', 'tokencontrol'].includes(interaction.commandName)) {
-            const embed = buildPanelEmbed(db, userId);
-            const components = buildPanelComponents(db, userId);
-            return interaction.reply({ embeds: [embed], components });
+            return interaction.reply({ embeds: [buildPanelEmbed(db, userId)], components: buildPanelComponents(db, userId) });
         }
     }
 
-    // Buton
     if (interaction.isButton()) {
         const id = interaction.customId;
 
         if (id === 'btn_token_add') {
             const modal = new ModalBuilder().setCustomId('modal_token_add').setTitle('🤖 Token Ekle');
-            const tokenInput = new TextInputBuilder().setCustomId('token').setLabel('Discord Kullanıcı Token').setStyle(TextInputStyle.Short).setPlaceholder('Token yapıştır...').setRequired(true).setMinLength(50);
-            const guildInput = new TextInputBuilder().setCustomId('guild_id').setLabel('Sunucu ID').setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true).setMinLength(17);
-            const channelInput = new TextInputBuilder().setCustomId('channel_id').setLabel('Ses Kanalı ID').setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true).setMinLength(17);
-            modal.addComponents(new ActionRowBuilder().addComponents(tokenInput), new ActionRowBuilder().addComponents(guildInput), new ActionRowBuilder().addComponents(channelInput));
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('token').setLabel('Discord Kullanıcı Token').setStyle(TextInputStyle.Short).setPlaceholder('Token yapıştır...').setRequired(true).setMinLength(50)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('guild_id').setLabel('Sunucu ID').setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true).setMinLength(17)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel_id').setLabel('Ses Kanalı ID').setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true).setMinLength(17)),
+            );
             return interaction.showModal(modal);
         }
 
-        if (id === 'btn_token_delete') {
-            const userAccounts = db.users.filter(u => u.userId === userId);
-            if (userAccounts.length === 0) return interaction.reply({ content: '❌ Silinecek hesap yok.', ephemeral: true });
-            const options = userAccounts.map((u, i) => ({ label: `Hesap ${i + 1}`, description: `Guild: ${u.guildId} | Kanal: ${u.channelId}`, value: u.id }));
-            const select = new ActionRowBuilder().addComponents(
-                new StringSelectMenuBuilder().setCustomId('select_token_delete').setPlaceholder('Silinecek hesabı seç').addOptions(options)
-            );
-            return interaction.reply({ content: '🗑️ Silinecek hesabı seç:', components: [select], ephemeral: true });
-        }
-
-        if (id === 'btn_account_select') {
+        if (id === 'btn_token_delete' || id === 'btn_account_select') {
             const userAccounts = db.users.filter(u => u.userId === userId);
             if (userAccounts.length === 0) return interaction.reply({ content: '❌ Hesap yok.', ephemeral: true });
             const options = userAccounts.map((u, i) => ({ label: `Hesap ${i + 1}`, description: `Guild: ${u.guildId} | Kanal: ${u.channelId}`, value: u.id }));
             const select = new ActionRowBuilder().addComponents(
-                new StringSelectMenuBuilder().setCustomId('select_account_active').setPlaceholder('Aktif hesabı seç').addOptions(options)
+                new StringSelectMenuBuilder().setCustomId(id === 'btn_token_delete' ? 'select_token_delete' : 'select_account_active').setPlaceholder('Hesap seç').addOptions(options)
             );
-            return interaction.reply({ content: '👤 Aktif hesabı seç:', components: [select], ephemeral: true });
+            return interaction.reply({ content: 'Hesap seç:', components: [select], ephemeral: true });
         }
 
-        if (id === 'btn_refresh') {
+        if (id === 'btn_refresh') return refreshPanel(interaction, db, userId);
+        if (id === 'btn_leave') { await stopSelfBot(userId); return refreshPanel(interaction, db, userId); }
+
+        if (id === 'btn_reconnect') {
+            const entry = db.users.find(u => u.userId === userId);
+            if (!entry) return interaction.reply({ content: '❌ Kayıtlı hesap yok.', ephemeral: true });
+            await stopSelfBot(userId);
+            await startSelfBot(entry);
             return refreshPanel(interaction, db, userId);
         }
 
@@ -234,7 +240,6 @@ main.on(Events.InteractionCreate, async (interaction) => {
             if (!s) return interaction.reply({ content: '❌ Aktif oturum yok.', ephemeral: true });
             s.muted = !s.muted;
             try { await s.connection?.setSpeaking?.(!s.muted); } catch {}
-            // discord.js-selfbot-v13 voice selfMute değiştirme
             try { await s.client.voice?.setSelfMute?.(s.muted); } catch {}
             return refreshPanel(interaction, db, userId);
         }
@@ -246,53 +251,8 @@ main.on(Events.InteractionCreate, async (interaction) => {
             try { await s.client.voice?.setSelfDeaf?.(s.deafened); } catch {}
             return refreshPanel(interaction, db, userId);
         }
-
-        if (id === 'btn_stream_start') {
-            const s = activeSessions.get(userId);
-            if (!s) return interaction.reply({ content: '❌ Aktif oturum yok.', ephemeral: true });
-            s.streaming = true;
-            return refreshPanel(interaction, db, userId);
-        }
-
-        if (id === 'btn_stream_stop') {
-            const s = activeSessions.get(userId);
-            if (!s) return interaction.reply({ content: '❌ Aktif oturum yok.', ephemeral: true });
-            s.streaming = false;
-            return refreshPanel(interaction, db, userId);
-        }
-
-        if (id === 'btn_leave') {
-            await stopSelfBot(userId);
-            return refreshPanel(interaction, db, userId);
-        }
-
-        if (id === 'btn_reconnect') {
-            const entry = db.users.find(u => u.userId === userId);
-            if (!entry) return interaction.reply({ content: '❌ Kayıtlı hesap yok.', ephemeral: true });
-            await stopSelfBot(userId);
-            await startSelfBot(entry);
-            return refreshPanel(interaction, db, userId);
-        }
-
-        if (id === 'btn_move_channel') {
-            const s = activeSessions.get(userId);
-            if (!s) return interaction.reply({ content: '❌ Aktif oturum yok.', ephemeral: true });
-            const modal = new ModalBuilder().setCustomId('modal_move_channel').setTitle('📢 Kanal Taşı');
-            const chInput = new TextInputBuilder().setCustomId('new_channel').setLabel('Yeni Ses Kanalı ID').setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true).setMinLength(17);
-            modal.addComponents(new ActionRowBuilder().addComponents(chInput));
-            return interaction.showModal(modal);
-        }
-
-        if (id === 'btn_rpc') {
-            const modal = new ModalBuilder().setCustomId('modal_rpc').setTitle('🎮 RPC Ayarla');
-            const nameInput = new TextInputBuilder().setCustomId('rpc_name').setLabel('Oynanıyor Metni').setStyle(TextInputStyle.Short).setPlaceholder('Örn: Minecraft').setRequired(true).setMaxLength(128);
-            const urlInput = new TextInputBuilder().setCustomId('rpc_url').setLabel('Twitch URL (opsiyonel)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(200);
-            modal.addComponents(new ActionRowBuilder().addComponents(nameInput), new ActionRowBuilder().addComponents(urlInput));
-            return interaction.showModal(modal);
-        }
     }
 
-    // Select menu
     if (interaction.isStringSelectMenu()) {
         const val = interaction.values[0];
         if (interaction.customId === 'select_token_delete') {
@@ -310,52 +270,23 @@ main.on(Events.InteractionCreate, async (interaction) => {
         }
     }
 
-    // Modal submit
-    if (interaction.type === InteractionType.ModalSubmit) {
-        if (interaction.customId === 'modal_token_add') {
-            const token = interaction.fields.getTextInputValue('token').trim();
-            const guildId = interaction.fields.getTextInputValue('guild_id').trim();
-            const channelId = interaction.fields.getTextInputValue('channel_id').trim();
-            if (!/^\d+$/.test(guildId) || !/^\d+$/.test(channelId)) return interaction.reply({ content: '❌ ID sayı olmalı.', ephemeral: true });
-            await interaction.deferReply({ ephemeral: true });
-            const id = 'acc_' + Date.now();
-            const entry = { id, userId, token, guildId, channelId, muted: false, deafened: true, createdAt: Date.now() };
-            const result = await startSelfBot(entry);
-            if (result.ok) {
-                db.users.push(entry);
-                saveDB(db);
-                return interaction.editReply({ content: `✅ Hesap eklendi: ${result.msg}\n**Token AES-256-GCM ile şifrelendi.**` });
-            }
-            return interaction.editReply({ content: `❌ Başarısız: ${result.msg}` });
-        }
+    if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'modal_token_add') {
+        const token = interaction.fields.getTextInputValue('token').trim();
+        const guildId = interaction.fields.getTextInputValue('guild_id').trim();
+        const channelId = interaction.fields.getTextInputValue('channel_id').trim();
+        if (!/^\d+$/.test(guildId) || !/^\d+$/.test(channelId)) return interaction.reply({ content: '❌ ID sayı olmalı.', ephemeral: true });
 
-        if (interaction.customId === 'modal_move_channel') {
-            const newCh = interaction.fields.getTextInputValue('new_channel').trim();
-            if (!/^\d+$/.test(newCh)) return interaction.reply({ content: '❌ ID sayı olmalı.', ephemeral: true });
-            const s = activeSessions.get(userId);
-            if (!s) return interaction.reply({ content: '❌ Aktif oturum yok.', ephemeral: true });
-            await interaction.deferReply({ ephemeral: true });
-            const entry = { ...s.config, channelId: newCh };
-            await stopSelfBot(userId);
-            const result = await startSelfBot(entry);
-            return interaction.editReply({ content: result.ok ? `✅ Kanal taşındı: ${result.msg}` : `❌ ${result.msg}` });
-        }
+        await interaction.deferReply({ ephemeral: true });
+        const id = 'acc_' + Date.now();
+        const entry = { id, userId, token, guildId, channelId, muted: false, deafened: true, createdAt: Date.now() };
+        const result = await startSelfBot(entry);
 
-        if (interaction.customId === 'modal_rpc') {
-            const name = interaction.fields.getTextInputValue('rpc_name').trim();
-            const url = interaction.fields.getTextInputValue('rpc_url').trim();
-            const s = activeSessions.get(userId);
-            if (!s) return interaction.reply({ content: '❌ Aktif oturum yok.', ephemeral: true });
-            try {
-                s.client.user.setPresence({
-                    activities: [{ name, type: url ? 1 : 0, url: url || undefined }],
-                    status: 'online'
-                });
-                return interaction.reply({ content: `✅ RPC ayarlandı: **${name}**`, ephemeral: true });
-            } catch (e) {
-                return interaction.reply({ content: `❌ RPC hatası: ${e.message}`, ephemeral: true });
-            }
+        if (result.ok) {
+            db.users.push(entry);
+            saveDB(db);
+            return interaction.editReply({ content: `✅ Hesap eklendi: ${result.msg}\n**Token AES-256-GCM ile şifrelendi.**` });
         }
+        return interaction.editReply({ content: `❌ Başarısız: ${result.msg}` });
     }
 });
 
@@ -363,7 +294,7 @@ main.on('error', (e) => logErr('MAIN', e.message));
 
 process.on('SIGINT', async () => {
     for (const [, s] of activeSessions) {
-        try { s.connection?.destroy(); } catch {}
+        try { s.connection?.disconnect(); } catch {}
         try { s.client?.destroy(); } catch {}
     }
     main.destroy();
