@@ -34,7 +34,7 @@ export function saveEncrypted(file, dataObj, keyStr) {
     fs.writeFileSync(file, encrypt(JSON.stringify(dataObj), keyStr), 'utf8');
 }
 
-export function loadEncrypted(file, keyStr, fallback = { afk: [] }) {
+export function loadEncrypted(file, keyStr, fallback = { users: [] }) {
     if (!fs.existsSync(file)) return fallback;
     try {
         return JSON.parse(decrypt(fs.readFileSync(file, 'utf8'), keyStr));
