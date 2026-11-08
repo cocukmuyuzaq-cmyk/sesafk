@@ -9,6 +9,7 @@ import { Client as SelfClient } from 'discord.js-selfbot-v13';
 import 'libsodium-wrappers';
 import { saveEncrypted, loadEncrypted } from './crypto.js';
 
+// ─── RENKLER & LOG ───
 const C = { reset: '\x1b[0m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', blue: '\x1b[34m', cyan: '\x1b[36m', gray: '\x1b[90m' };
 function ts() { return new Date().toLocaleTimeString('tr-TR', { hour12: false }); }
 function log(tag, msg, color = C.cyan) { console.log(`${C.gray}[${ts()}]${C.reset} ${color}[${tag}]${C.reset} ${msg}`); }
@@ -24,21 +25,20 @@ function saveDB(db) { saveEncrypted(config.DB_FILE, db, config.AES_KEY); }
 
 const activeSessions = new Map();
 
-// ─── Self bot başlat (kütüphanenin kendi voice manager'ı ile) ───
+// ─── SELF BOT BAŞLATMA (Zaman aşımı uzatıldı) ───
 async function startSelfBot(entry) {
-    const { id, userId, token, guildId, channelId, muted = false, deafened = true } = entry;
+    const { userId, token, guildId, channelId, muted = false, deafened = true } = entry;
 
-    if (activeSessions.has(userId)) {
-        await stopSelfBot(userId);
-    }
+    if (activeSessions.has(userId)) await stopSelfBot(userId);
 
     const client = new SelfClient({ checkUpdate: false });
 
     return new Promise((resolve) => {
+        // Giriş için 60 saniye bekle (Render yavaşlığına karşı)
         const timeout = setTimeout(() => {
             try { client.destroy(); } catch {}
-            resolve({ ok: false, msg: 'Giriş zaman aşımı (30s)' });
-        }, 30000);
+            resolve({ ok: false, msg: 'Giriş zaman aşımı (60s)' });
+        }, 60000);
 
         client.once('ready', async () => {
             clearTimeout(timeout);
@@ -57,30 +57,27 @@ async function startSelfBot(entry) {
             const channel = guild.channels.cache.get(channelId);
             if (!channel) { try { client.destroy(); } catch {} return resolve({ ok: false, msg: 'Kanal bulunamadı' }); }
 
-            // Kanal dolu mu kontrolü (abort hatasının sık nedeni)
+            // Kanal dolu mu?
             if (channel.userLimit > 0 && channel.members.size >= channel.userLimit) {
                 try { client.destroy(); } catch {}
                 return resolve({ ok: false, msg: `Kanal dolu (limit: ${channel.userLimit})` });
             }
 
             try {
-                // Kütüphanenin kendi joinChannel metodu
+                logWarn('SELF', `Ses kanalına bağlanmaya çalışılıyor... (Bu işlem 15sn sürebilir)`);
+                // Timeout 45 saniyeye çıkarıldı (15sn standart hatasını çözmek için)
                 const connection = await client.voice.joinChannel(channel, {
                     selfMute: muted,
                     selfDeaf: deafened,
-                    timeout: 60000, // 60 saniye timeout
+                    timeout: 45000, 
                 });
 
                 logOk('SELF', `'${channel.name}' kanalına bağlandı`);
+                activeSessions.set(userId, { client, connection, config: entry, muted, deafened });
 
-                activeSessions.set(userId, { client, connection, config: entry, muted, deafened, streaming: false });
-
-                // Bağlantı koptuğunda yeniden bağlan
                 connection.on('disconnect', () => {
                     logWarn('SELF', `Bağlantı koptu, yeniden bağlanılıyor...`);
-                    if (config.RECONNECT.enabled) {
-                        setTimeout(() => reconnectSelf(entry), config.RECONNECT.delayMs);
-                    }
+                    if (config.RECONNECT.enabled) setTimeout(() => reconnectSelf(entry), config.RECONNECT.delayMs);
                 });
 
                 resolve({ ok: true, msg: `'${channel.name}' kanalına bağlandı` });
@@ -92,7 +89,6 @@ async function startSelfBot(entry) {
         });
 
         client.on('error', (e) => logErr('SELF', `Client hatası: ${e.message}`));
-
         client.login(token).catch((e) => {
             clearTimeout(timeout);
             resolve({ ok: false, msg: `Giriş hatası: ${e.message}` });
@@ -119,23 +115,28 @@ async function stopSelfBot(userId) {
     return { ok: true, msg: 'Durduruldu' };
 }
 
-// ─── Panel embed (aynı) ───
+// ─── YENİ VE MODERN PANEL TASARIMI ───
 function buildPanelEmbed(db, userId) {
     const session = activeSessions.get(userId);
     const accountCount = db.users.filter(u => u.userId === userId).length;
-    const status = session ? '🟢 Bağlı' : '🔴 Bağlı değil';
+    
+    const status = session ? '🟢 **Bağlı**' : '🔴 **Bağlı Değil**';
+    const mic = session ? (session.muted ? '🔇 Kapalı' : '🔊 Açık') : '⚫ -';
+    const deaf = session ? (session.deafened ? '🔇 Kapalı' : '🔊 Açık') : '⚫ -';
+    const channel = session ? `<#${session.config.channelId}>` : '⚫ -';
 
     return new EmbedBuilder()
-        .setColor(session ? 0x00ff00 : 0xff8fc7)
-        .setTitle('🎙️ SES AFK PANELİ')
-        .setDescription(
-            `**Durum:** ${status}\n` +
-            `**Hesap Sayısı:** ${accountCount}\n` +
-            (session ? `**Kanal:** <#${session.config.channelId}>\n**Mikrofon:** ${session.muted ? '🔇 Kapalı' : '🔊 Açık'}\n**Kulaklık:** ${session.deafened ? '🔇 Kapalı' : '🔊 Açık'}\n` : '') +
-            `\n**Token:** AES-256-GCM ile şifreli`
+        .setColor(session ? 0x2ecc71 : 0xe74c3c) // Yeşil veya Kırmızı
+        .setAuthor({ name: 'SES AFK • Kontrol Paneli', iconURL: config.LOGO_URL })
+        .setTitle('🎙️ Hesap Durumu')
+        .setDescription(`> **Sistem Durumu:** ${status}\n> **Ses Kanalı:** ${channel}`)
+        .addFields(
+            { name: '👤 Hesap Sayısı', value: `\`${accountCount} Adet\``, inline: true },
+            { name: '🎤 Mikrofon', value: `\`${mic}\``, inline: true },
+            { name: '🎧 Kulaklık', value: `\`${deaf}\``, inline: true },
         )
         .setThumbnail(config.LOGO_URL)
-        .setFooter({ text: 'SES AFK • 7/24 Ses Kanalı', iconURL: config.LOGO_URL })
+        .setFooter({ text: 'SES AFK • 7/24 Kesintisiz Ses', iconURL: config.LOGO_URL })
         .setTimestamp();
 }
 
@@ -153,8 +154,8 @@ function buildPanelComponents(db, userId) {
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('btn_mic_toggle').setLabel(session?.muted ? 'Mik Aç' : 'Mik Kapat').setEmoji(session?.muted ? '🔊' : '🔇').setStyle(ButtonStyle.Secondary).setDisabled(!session),
         new ButtonBuilder().setCustomId('btn_deaf_toggle').setLabel(session?.deafened ? 'Kulak Aç' : 'Kulak Kapat').setEmoji(session?.deafened ? '🔊' : '🔇').setStyle(ButtonStyle.Secondary).setDisabled(!session),
-        new ButtonBuilder().setCustomId('btn_leave').setLabel('Ses Kanalından Çıkar').setEmoji('🚪').setStyle(ButtonStyle.Danger).setDisabled(!session),
-        new ButtonBuilder().setCustomId('btn_reconnect').setLabel('Yenile (Sıfırdan)').setEmoji('🔄').setStyle(ButtonStyle.Primary).setDisabled(!session),
+        new ButtonBuilder().setCustomId('btn_reconnect').setLabel('Sıfırdan Bağlan').setEmoji('⚡').setStyle(ButtonStyle.Primary).setDisabled(!session),
+        new ButtonBuilder().setCustomId('btn_leave').setLabel('Kanal Çık').setEmoji('🚪').setStyle(ButtonStyle.Danger).setDisabled(!session),
     );
 
     return [row1, row2];
@@ -169,47 +170,47 @@ async function refreshPanel(interaction, db, userId) {
     return interaction.update({ embeds: [embed], components });
 }
 
-// ─── Panel botu ───
+// ─── ANA PANEL BOTU ───
 const main = new PanelClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
 main.once(Events.ClientReady, async () => {
-    console.log('');
+    console.clear();
     logOk('MAIN', `Panel hazır: ${main.user.tag}`);
     try { await main.user.setUsername(config.BOT_NAME); } catch {}
     try { main.user.setPresence({ activities: [{ name: 'Sesde AFK', type: ActivityType.Custom, state: 'Sesde AFK' }], status: 'online' }); } catch {}
-    console.log('');
 
     const commands = [
         { name: 'panel', description: 'SES AFK panelini aç' },
         { name: 'tokencontrol', description: 'Token kontrol panelini aç' },
     ];
-    try { await main.application.commands.set(commands); logOk('MAIN', `${commands.length} slash komut kaydedildi`); } catch (e) { logErr('MAIN', `Slash kayıt hatası: ${e.message}`); }
+    try { await main.application.commands.set(commands); logOk('MAIN', `${commands.length} slash komut kaydedildi`); } catch (e) {}
 
     import('http').then(({ createServer }) => {
         createServer((req, res) => res.end(`${config.BOT_NAME} aktif`)).listen(process.env.PORT || 3000);
     });
 });
 
-// ─── Etkileşimler ───
 main.on(Events.InteractionCreate, async (interaction) => {
     const userId = interaction.user.id;
     let db = loadDB();
 
+    // 1. SLASH KOMUTLARI
     if (interaction.isChatInputCommand()) {
         if (['panel', 'tokencontrol'].includes(interaction.commandName)) {
             return interaction.reply({ embeds: [buildPanelEmbed(db, userId)], components: buildPanelComponents(db, userId) });
         }
     }
 
+    // 2. BUTONLAR
     if (interaction.isButton()) {
         const id = interaction.customId;
 
         if (id === 'btn_token_add') {
             const modal = new ModalBuilder().setCustomId('modal_token_add').setTitle('🤖 Token Ekle');
             modal.addComponents(
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('token').setLabel('Discord Kullanıcı Token').setStyle(TextInputStyle.Short).setPlaceholder('Token yapıştır...').setRequired(true).setMinLength(50)),
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('guild_id').setLabel('Sunucu ID').setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true).setMinLength(17)),
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel_id').setLabel('Ses Kanalı ID').setStyle(TextInputStyle.Short).setPlaceholder('123456789012345678').setRequired(true).setMinLength(17)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('token').setLabel('Discord Kullanıcı Token').setStyle(TextInputStyle.Short).setRequired(true).setMinLength(50)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('guild_id').setLabel('Sunucu ID').setStyle(TextInputStyle.Short).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel_id').setLabel('Ses Kanalı ID').setStyle(TextInputStyle.Short).setRequired(true)),
             );
             return interaction.showModal(modal);
         }
@@ -217,7 +218,7 @@ main.on(Events.InteractionCreate, async (interaction) => {
         if (id === 'btn_token_delete' || id === 'btn_account_select') {
             const userAccounts = db.users.filter(u => u.userId === userId);
             if (userAccounts.length === 0) return interaction.reply({ content: '❌ Hesap yok.', ephemeral: true });
-            const options = userAccounts.map((u, i) => ({ label: `Hesap ${i + 1}`, description: `Guild: ${u.guildId} | Kanal: ${u.channelId}`, value: u.id }));
+            const options = userAccounts.map((u, i) => ({ label: `Hesap ${i + 1}`, description: `Kanal: ${u.channelId}`, value: u.id }));
             const select = new ActionRowBuilder().addComponents(
                 new StringSelectMenuBuilder().setCustomId(id === 'btn_token_delete' ? 'select_token_delete' : 'select_account_active').setPlaceholder('Hesap seç').addOptions(options)
             );
@@ -230,29 +231,29 @@ main.on(Events.InteractionCreate, async (interaction) => {
         if (id === 'btn_reconnect') {
             const entry = db.users.find(u => u.userId === userId);
             if (!entry) return interaction.reply({ content: '❌ Kayıtlı hesap yok.', ephemeral: true });
+            await interaction.deferUpdate(); // Botun düşünmesini engelle
             await stopSelfBot(userId);
             await startSelfBot(entry);
             return refreshPanel(interaction, db, userId);
         }
 
-        if (id === 'btn_mic_toggle') {
+        if (id === 'btn_mic_toggle' || id === 'btn_deaf_toggle') {
             const s = activeSessions.get(userId);
             if (!s) return interaction.reply({ content: '❌ Aktif oturum yok.', ephemeral: true });
-            s.muted = !s.muted;
-            try { await s.connection?.setSpeaking?.(!s.muted); } catch {}
-            try { await s.client.voice?.setSelfMute?.(s.muted); } catch {}
-            return refreshPanel(interaction, db, userId);
-        }
-
-        if (id === 'btn_deaf_toggle') {
-            const s = activeSessions.get(userId);
-            if (!s) return interaction.reply({ content: '❌ Aktif oturum yok.', ephemeral: true });
-            s.deafened = !s.deafened;
-            try { await s.client.voice?.setSelfDeaf?.(s.deafened); } catch {}
+            
+            if (id === 'btn_mic_toggle') {
+                s.muted = !s.muted;
+                try { await s.connection?.setSpeaking?.(!s.muted); } catch {}
+                try { await s.client.voice?.setSelfMute?.(s.muted); } catch {}
+            } else {
+                s.deafened = !s.deafened;
+                try { await s.client.voice?.setSelfDeaf?.(s.deafened); } catch {}
+            }
             return refreshPanel(interaction, db, userId);
         }
     }
 
+    // 3. SEÇİM MENÜLERİ
     if (interaction.isStringSelectMenu()) {
         const val = interaction.values[0];
         if (interaction.customId === 'select_token_delete') {
@@ -264,29 +265,36 @@ main.on(Events.InteractionCreate, async (interaction) => {
         if (interaction.customId === 'select_account_active') {
             const entry = db.users.find(u => u.id === val);
             if (!entry) return interaction.update({ content: '❌ Hesap bulunamadı.', components: [] });
+            
+            await interaction.update({ content: '⏳ Hesap değiştiriliyor, lütfen bekleyin...', components: [] });
             await stopSelfBot(userId);
             await startSelfBot(entry);
-            return interaction.update({ content: `✅ Aktif hesap: \`${entry.id}\``, components: [] });
+            return;
         }
     }
 
+    // 4. MODAL FORMU (HATA DÜZELTİLDİ)
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'modal_token_add') {
         const token = interaction.fields.getTextInputValue('token').trim();
         const guildId = interaction.fields.getTextInputValue('guild_id').trim();
         const channelId = interaction.fields.getTextInputValue('channel_id').trim();
+        
         if (!/^\d+$/.test(guildId) || !/^\d+$/.test(channelId)) return interaction.reply({ content: '❌ ID sayı olmalı.', ephemeral: true });
 
+        // ⚠️ ÖNEMLİ: 3 saniye kuralını aşmamak için deferReply kullanıyoruz. (Botun düşünmesini engeller)
         await interaction.deferReply({ ephemeral: true });
+        
         const id = 'acc_' + Date.now();
         const entry = { id, userId, token, guildId, channelId, muted: false, deafened: true, createdAt: Date.now() };
+        
         const result = await startSelfBot(entry);
 
         if (result.ok) {
             db.users.push(entry);
             saveDB(db);
-            return interaction.editReply({ content: `✅ Hesap eklendi: ${result.msg}\n**Token AES-256-GCM ile şifrelendi.**` });
+            return interaction.editReply({ content: `✅ **Hesap eklendi!**\n${result.msg}\n\n*(Token AES-256-GCM ile şifrelendi)*` });
         }
-        return interaction.editReply({ content: `❌ Başarısız: ${result.msg}` });
+        return interaction.editReply({ content: `❌ **Başarısız:** ${result.msg}` });
     }
 });
 
