@@ -9,6 +9,6 @@
   "dependencies": {
     "discord.js": "^14.16.3",
     "@discordjs/voice": "^0.18.0",
-    "libsodium-wrappers": "^0.7.15"
+    "libsodium-wrappers": "0.7.13"
   }
 }
