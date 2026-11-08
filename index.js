@@ -1,10 +1,11 @@
 import config from './config.js';
 import {
-    Client, GatewayIntentBits, EmbedBuilder, ActivityType,
+    Client as PanelClient, GatewayIntentBits, EmbedBuilder, ActivityType,
     ActionRowBuilder, ButtonBuilder, ButtonStyle,
     ModalBuilder, TextInputBuilder, TextInputStyle,
     InteractionType, Events
 } from 'discord.js';
+import { Client as SelfClient } from 'discord.js-selfbot-v13';
 import { joinVoiceChannel, VoiceConnectionStatus, entersState } from '@discordjs/voice';
 import 'libsodium-wrappers';
 import { saveEncrypted, loadEncrypted } from './crypto.js';
@@ -30,11 +31,13 @@ function saveDB(db) { saveEncrypted(config.DB_FILE, db, config.AES_KEY); }
 
 const activeBots = new Map();
 
+// ─── Kullanıcı token'ı ile ses kanalına gir ───
 async function startAFKBot(entry) {
     const { id, token, guildId, channelId } = entry;
     if (activeBots.has(id)) return { ok: false, msg: 'Bu bot zaten çalışıyor' };
 
-    const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+    // Self-bot client (kullanıcı token'ı)
+    const client = new SelfClient({ checkUpdate: false });
 
     return new Promise((resolve) => {
         const timeout = setTimeout(() => {
@@ -44,12 +47,11 @@ async function startAFKBot(entry) {
 
         client.once('ready', async () => {
             clearTimeout(timeout);
-            logOk('AFK', `Bot ${id} giriş: ${client.user.tag}`);
+            logOk('AFK', `Kullanıcı giriş: ${client.user.tag}`);
 
-            try { await client.user.setUsername(config.BOT_NAME); } catch {}
             try {
                 client.user.setPresence({
-                    activities: [{ name: 'Sesde AFK', type: ActivityType.Custom, state: 'Sesde AFK' }],
+                    activities: [{ name: 'Sesde AFK', type: 'CUSTOM', state: 'Sesde AFK' }],
                     status: 'online',
                 });
             } catch {}
@@ -66,10 +68,11 @@ async function startAFKBot(entry) {
                     selfMute: false, selfDeaf: true,
                 });
                 await entersState(connection, VoiceConnectionStatus.Ready, 30000);
-                logOk('AFK', `Bot ${id} '${channel.name}' kanalına bağlandı`);
+                logOk('AFK', `Kullanıcı '${channel.name}' kanalına bağlandı`);
                 activeBots.set(id, { client, connection, info: entry });
 
                 connection.on(VoiceConnectionStatus.Disconnected, async () => {
+                    logWarn('AFK', `Bağlantı koptu, yeniden bağlanılıyor...`);
                     try {
                         await Promise.race([
                             entersState(connection, VoiceConnectionStatus.Signalling, 5000),
@@ -87,7 +90,7 @@ async function startAFKBot(entry) {
             }
         });
 
-        client.on('error', (e) => logErr('AFK', `Bot ${id} client hatası: ${e.message}`));
+        client.on('error', (e) => logErr('AFK', `Client hatası: ${e.message}`));
         client.login(token).catch((e) => {
             clearTimeout(timeout);
             resolve({ ok: false, msg: `Giriş hatası: ${e.message}` });
@@ -122,7 +125,8 @@ function makeEmbed(title, description, color = 0xff8fc7) {
         .setTimestamp();
 }
 
-const main = new Client({
+// ─── Panel botu (bot token'ı) ───
+const main = new PanelClient({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
@@ -132,7 +136,7 @@ const main = new Client({
 
 main.once(Events.ClientReady, async () => {
     console.log('');
-    logOk('MAIN', `Hazır: ${main.user.tag}`);
+    logOk('MAIN', `Panel hazır: ${main.user.tag}`);
     try { await main.user.setUsername(config.BOT_NAME); } catch {}
     try {
         main.user.setPresence({
@@ -142,11 +146,11 @@ main.once(Events.ClientReady, async () => {
     } catch {}
     console.log('');
 
-    // Slash komutları kaydet (global)
+    // Slash komutları kaydet
     const commands = [
         { name: 'panel', description: 'SES AFK panelini aç' },
-        { name: 'afk-liste', description: 'Kayıtlı AFK botlarını listele' },
-        { name: 'afk-durum', description: 'Aktif botların durumunu göster' },
+        { name: 'afk-liste', description: 'Kayıtlı AFK hesaplarını listele' },
+        { name: 'afk-durum', description: 'Aktif hesapların durumunu göster' },
     ];
     try {
         await main.application.commands.set(commands);
@@ -155,13 +159,13 @@ main.once(Events.ClientReady, async () => {
         logErr('MAIN', `Slash komut kaydedilemedi: ${e.message}`);
     }
 
-    // Render için HTTP
+    // Render için HTTP sunucusu
     import('http').then(({ createServer }) => {
         createServer((req, res) => res.end(`${config.BOT_NAME} aktif`)).listen(process.env.PORT || 3000);
     });
 });
 
-// ─── Mesaj komutları (prefix !) ───
+// ─── Mesaj komutları (!) ───
 main.on('messageCreate', async (msg) => {
     if (msg.author.bot || !msg.content.startsWith('!')) return;
     const args = msg.content.slice(1).trim().split(/\s+/);
@@ -171,10 +175,11 @@ main.on('messageCreate', async (msg) => {
         const embed = makeEmbed('🎙️ SES AFK PANELİ',
             'Aşağıdaki **"Sesde AFK Ol"** butonuna bas, formu doldur.\n\n' +
             '**Gerekli bilgiler:**\n' +
-            '• **Bot Token** — Developer Portal\'dan aldığın token\n' +
+            '• **Kullanıcı Token** — Discord hesabının token\'ı\n' +
             '• **Sunucu ID** — Sunucuya sağ tık → ID Kopyala\n' +
             '• **Ses Kanalı ID** — Kanala sağ tık → ID Kopyala\n\n' +
-            '> ⚠️ Token AES-256-GCM ile şifrelenip saklanır.'
+            '> ⚠️ Token AES-256-GCM ile şifrelenip saklanır.\n' +
+            '> ⚠️ Self-bot ToS\'a aykırıdır, hesap yasaklanabilir.'
         );
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -188,16 +193,16 @@ main.on('messageCreate', async (msg) => {
 
     if (cmd === 'afk-liste') {
         const db = loadDB();
-        if (db.afk.length === 0) return msg.reply({ embeds: [makeEmbed('📋 AFK Botlar', 'Kayıt yok.', 0xffd93d)] });
+        if (db.afk.length === 0) return msg.reply({ embeds: [makeEmbed('📋 AFK Hesaplar', 'Kayıt yok.', 0xffd93d)] });
         const lines = db.afk.map((e) => `${activeBots.has(e.id) ? '🟢' : '🔴'} \`${e.id}\` — Guild: \`${e.guildId}\` — Kanal: \`${e.channelId}\``);
-        return msg.reply({ embeds: [makeEmbed('📋 AFK Botlar', lines.join('\n'))] });
+        return msg.reply({ embeds: [makeEmbed('📋 AFK Hesaplar', lines.join('\n'))] });
     }
 
     if (cmd === 'afk-durum') {
-        if (activeBots.size === 0) return msg.reply({ embeds: [makeEmbed('📊 Durum', 'Aktif bot yok.', 0xffd93d)] });
+        if (activeBots.size === 0) return msg.reply({ embeds: [makeEmbed('📊 Durum', 'Aktif hesap yok.', 0xffd93d)] });
         const lines = [];
         for (const [id, b] of activeBots) lines.push(`🟢 \`${id}\` — ${b.client.user?.tag || '?'} — **${b.connection?.state?.status || 'unknown'}**`);
-        return msg.reply({ embeds: [makeEmbed('📊 Aktif Botlar', lines.join('\n'))] });
+        return msg.reply({ embeds: [makeEmbed('📊 Aktif Hesaplar', lines.join('\n'))] });
     }
 
     if (cmd === 'afk-sil') {
@@ -213,18 +218,18 @@ main.on('messageCreate', async (msg) => {
     }
 });
 
-// ─── Slash komutlar ───
+// ─── Slash + buton + modal ───
 main.on(Events.InteractionCreate, async (interaction) => {
-    // Slash komut
     if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'panel') {
             const embed = makeEmbed('🎙️ SES AFK PANELİ',
                 'Aşağıdaki **"Sesde AFK Ol"** butonuna bas, formu doldur.\n\n' +
                 '**Gerekli bilgiler:**\n' +
-                '• **Bot Token** — Developer Portal\'dan aldığın token\n' +
+                '• **Kullanıcı Token** — Discord hesabının token\'ı\n' +
                 '• **Sunucu ID** — Sunucuya sağ tık → ID Kopyala\n' +
                 '• **Ses Kanalı ID** — Kanala sağ tık → ID Kopyala\n\n' +
-                '> ⚠️ Token AES-256-GCM ile şifrelenip saklanır.'
+                '> ⚠️ Token AES-256-GCM ile şifrelenip saklanır.\n' +
+                '> ⚠️ Self-bot ToS\'a aykırıdır, hesap yasaklanabilir.'
             );
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
@@ -238,20 +243,20 @@ main.on(Events.InteractionCreate, async (interaction) => {
 
         if (interaction.commandName === 'afk-liste') {
             const db = loadDB();
-            if (db.afk.length === 0) return interaction.reply({ embeds: [makeEmbed('📋 AFK Botlar', 'Kayıt yok.', 0xffd93d)] });
+            if (db.afk.length === 0) return interaction.reply({ embeds: [makeEmbed('📋 AFK Hesaplar', 'Kayıt yok.', 0xffd93d)] });
             const lines = db.afk.map((e) => `${activeBots.has(e.id) ? '🟢' : '🔴'} \`${e.id}\` — Guild: \`${e.guildId}\` — Kanal: \`${e.channelId}\``);
-            return interaction.reply({ embeds: [makeEmbed('📋 AFK Botlar', lines.join('\n'))] });
+            return interaction.reply({ embeds: [makeEmbed('📋 AFK Hesaplar', lines.join('\n'))] });
         }
 
         if (interaction.commandName === 'afk-durum') {
-            if (activeBots.size === 0) return interaction.reply({ embeds: [makeEmbed('📊 Durum', 'Aktif bot yok.', 0xffd93d)] });
+            if (activeBots.size === 0) return interaction.reply({ embeds: [makeEmbed('📊 Durum', 'Aktif hesap yok.', 0xffd93d)] });
             const lines = [];
             for (const [id, b] of activeBots) lines.push(`🟢 \`${id}\` — ${b.client.user?.tag || '?'} — **${b.connection?.state?.status || 'unknown'}**`);
-            return interaction.reply({ embeds: [makeEmbed('📊 Aktif Botlar', lines.join('\n'))] });
+            return interaction.reply({ embeds: [makeEmbed('📊 Aktif Hesaplar', lines.join('\n'))] });
         }
     }
 
-    // Buton
+    // Buton → modal
     if (interaction.isButton() && interaction.customId === 'open_afk_modal') {
         const modal = new ModalBuilder()
             .setCustomId('afk_modal_submit')
@@ -259,9 +264,9 @@ main.on(Events.InteractionCreate, async (interaction) => {
 
         const tokenInput = new TextInputBuilder()
             .setCustomId('token')
-            .setLabel('Bot Token')
+            .setLabel('Kullanıcı Token')
             .setStyle(TextInputStyle.Short)
-            .setPlaceholder('MTU2...')
+            .setPlaceholder('Kullanıcı token\'ını yapıştır...')
             .setRequired(true)
             .setMinLength(50);
 
@@ -311,7 +316,7 @@ main.on(Events.InteractionCreate, async (interaction) => {
             saveDB(db);
             return interaction.editReply({
                 embeds: [makeEmbed('✅ Başarılı',
-                    `Bot \`${id}\` oluşturuldu.\n${result.msg}\n\n**Token AES-256-GCM ile şifrelendi.**`, 0x00ff00)]
+                    `Hesap \`${id}\` oluşturuldu.\n${result.msg}\n\n**Token AES-256-GCM ile şifrelendi.**`, 0x00ff00)]
             });
         } else {
             return interaction.editReply({
