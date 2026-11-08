@@ -9,7 +9,6 @@ import { Client as SelfClient } from 'discord.js-selfbot-v13';
 import 'libsodium-wrappers';
 import { saveEncrypted, loadEncrypted } from './crypto.js';
 
-// ─── RENKLER & LOG ───
 const C = { reset: '\x1b[0m', red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', blue: '\x1b[34m', cyan: '\x1b[36m', gray: '\x1b[90m' };
 function ts() { return new Date().toLocaleTimeString('tr-TR', { hour12: false }); }
 function log(tag, msg, color = C.cyan) { console.log(`${C.gray}[${ts()}]${C.reset} ${color}[${tag}]${C.reset} ${msg}`); }
@@ -25,7 +24,7 @@ function saveDB(db) { saveEncrypted(config.DB_FILE, db, config.AES_KEY); }
 
 const activeSessions = new Map();
 
-// ─── SELF BOT BAŞLATMA (Zaman aşımı uzatıldı) ───
+// ─── SELF BOT BAŞLATMA (Retry Mekanizmalı) ───
 async function startSelfBot(entry) {
     const { userId, token, guildId, channelId, muted = false, deafened = true } = entry;
 
@@ -34,7 +33,6 @@ async function startSelfBot(entry) {
     const client = new SelfClient({ checkUpdate: false });
 
     return new Promise((resolve) => {
-        // Giriş için 60 saniye bekle (Render yavaşlığına karşı)
         const timeout = setTimeout(() => {
             try { client.destroy(); } catch {}
             resolve({ ok: false, msg: 'Giriş zaman aşımı (60s)' });
@@ -57,34 +55,46 @@ async function startSelfBot(entry) {
             const channel = guild.channels.cache.get(channelId);
             if (!channel) { try { client.destroy(); } catch {} return resolve({ ok: false, msg: 'Kanal bulunamadı' }); }
 
-            // Kanal dolu mu?
             if (channel.userLimit > 0 && channel.members.size >= channel.userLimit) {
                 try { client.destroy(); } catch {}
                 return resolve({ ok: false, msg: `Kanal dolu (limit: ${channel.userLimit})` });
             }
 
-            try {
-                logWarn('SELF', `Ses kanalına bağlanmaya çalışılıyor... (Bu işlem 15sn sürebilir)`);
-                // Timeout 45 saniyeye çıkarıldı (15sn standart hatasını çözmek için)
-                const connection = await client.voice.joinChannel(channel, {
-                    selfMute: muted,
-                    selfDeaf: deafened,
-                    timeout: 45000, 
-                });
+            // ─── SES BAĞLANTI ISRARI (RETRY) ───
+            let attempts = 0;
+            const maxAttempts = 3;
 
-                logOk('SELF', `'${channel.name}' kanalına bağlandı`);
-                activeSessions.set(userId, { client, connection, config: entry, muted, deafened });
+            while (attempts < maxAttempts) {
+                try {
+                    attempts++;
+                    logWarn('SELF', `Ses kanalına bağlanmaya çalışılıyor... (Deneme ${attempts}/${maxAttempts})`);
+                    
+                    // Kütüphanenin kendi joinChannel metodunu kullanıyoruz
+                    const connection = await client.voice.joinChannel(channel, {
+                        selfMute: muted,
+                        selfDeaf: deafened,
+                        timeout: 60000, // Kütüphanenin kendi içindeki süreyi esnetmek için
+                    });
 
-                connection.on('disconnect', () => {
-                    logWarn('SELF', `Bağlantı koptu, yeniden bağlanılıyor...`);
-                    if (config.RECONNECT.enabled) setTimeout(() => reconnectSelf(entry), config.RECONNECT.delayMs);
-                });
+                    logOk('SELF', `'${channel.name}' kanalına başarıyla bağlandı!`);
+                    activeSessions.set(userId, { client, connection, config: entry, muted, deafened });
 
-                resolve({ ok: true, msg: `'${channel.name}' kanalına bağlandı` });
-            } catch (e) {
-                logErr('SELF', `Ses hatası: ${e.message}`);
-                try { client.destroy(); } catch {}
-                resolve({ ok: false, msg: `Ses hatası: ${e.message}` });
+                    connection.on('disconnect', () => {
+                        logWarn('SELF', `Bağlantı koptu, yeniden bağlanılıyor...`);
+                        if (config.RECONNECT.enabled) setTimeout(() => reconnectSelf(entry), config.RECONNECT.delayMs);
+                    });
+
+                    return resolve({ ok: true, msg: `'${channel.name}' kanalına bağlandı` });
+                    
+                } catch (e) {
+                    logErr('SELF', `Deneme ${attempts} başarısız: ${e.message}`);
+                    if (attempts >= maxAttempts) {
+                        try { client.destroy(); } catch {}
+                        return resolve({ ok: false, msg: `Ses hatası: ${e.message} (Render NAT/Timeout)` });
+                    }
+                    // Tekrar denemeden önce 3 saniye bekle (NAT tablosunun temizlenmesi için)
+                    await new Promise(r => setTimeout(r, 3000));
+                }
             }
         });
 
@@ -115,7 +125,7 @@ async function stopSelfBot(userId) {
     return { ok: true, msg: 'Durduruldu' };
 }
 
-// ─── YENİ VE MODERN PANEL TASARIMI ───
+// ─── PANEL TASARIMI ───
 function buildPanelEmbed(db, userId) {
     const session = activeSessions.get(userId);
     const accountCount = db.users.filter(u => u.userId === userId).length;
@@ -126,7 +136,7 @@ function buildPanelEmbed(db, userId) {
     const channel = session ? `<#${session.config.channelId}>` : '⚫ -';
 
     return new EmbedBuilder()
-        .setColor(session ? 0x2ecc71 : 0xe74c3c) // Yeşil veya Kırmızı
+        .setColor(session ? 0x2ecc71 : 0xe74c3c)
         .setAuthor({ name: 'SES AFK • Kontrol Paneli', iconURL: config.LOGO_URL })
         .setTitle('🎙️ Hesap Durumu')
         .setDescription(`> **Sistem Durumu:** ${status}\n> **Ses Kanalı:** ${channel}`)
@@ -194,14 +204,12 @@ main.on(Events.InteractionCreate, async (interaction) => {
     const userId = interaction.user.id;
     let db = loadDB();
 
-    // 1. SLASH KOMUTLARI
     if (interaction.isChatInputCommand()) {
         if (['panel', 'tokencontrol'].includes(interaction.commandName)) {
             return interaction.reply({ embeds: [buildPanelEmbed(db, userId)], components: buildPanelComponents(db, userId) });
         }
     }
 
-    // 2. BUTONLAR
     if (interaction.isButton()) {
         const id = interaction.customId;
 
@@ -231,7 +239,7 @@ main.on(Events.InteractionCreate, async (interaction) => {
         if (id === 'btn_reconnect') {
             const entry = db.users.find(u => u.userId === userId);
             if (!entry) return interaction.reply({ content: '❌ Kayıtlı hesap yok.', ephemeral: true });
-            await interaction.deferUpdate(); // Botun düşünmesini engelle
+            await interaction.deferUpdate(); 
             await stopSelfBot(userId);
             await startSelfBot(entry);
             return refreshPanel(interaction, db, userId);
@@ -253,7 +261,6 @@ main.on(Events.InteractionCreate, async (interaction) => {
         }
     }
 
-    // 3. SEÇİM MENÜLERİ
     if (interaction.isStringSelectMenu()) {
         const val = interaction.values[0];
         if (interaction.customId === 'select_token_delete') {
@@ -273,7 +280,6 @@ main.on(Events.InteractionCreate, async (interaction) => {
         }
     }
 
-    // 4. MODAL FORMU (HATA DÜZELTİLDİ)
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'modal_token_add') {
         const token = interaction.fields.getTextInputValue('token').trim();
         const guildId = interaction.fields.getTextInputValue('guild_id').trim();
@@ -281,7 +287,6 @@ main.on(Events.InteractionCreate, async (interaction) => {
         
         if (!/^\d+$/.test(guildId) || !/^\d+$/.test(channelId)) return interaction.reply({ content: '❌ ID sayı olmalı.', ephemeral: true });
 
-        // ⚠️ ÖNEMLİ: 3 saniye kuralını aşmamak için deferReply kullanıyoruz. (Botun düşünmesini engeller)
         await interaction.deferReply({ ephemeral: true });
         
         const id = 'acc_' + Date.now();
